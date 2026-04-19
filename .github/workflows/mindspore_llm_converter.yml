@@ -48,8 +48,12 @@ jobs:
           export LD_LIBRARY_PATH=$MSLITE_PATH/tools/converter/lib:$LD_LIBRARY_PATH
           
           if [ "${{ github.event.inputs.quantize }}" == "true" ]; then
-            QUANT_FLAG="--commonQuantWeight=true --bitNum=4"
-            echo "Running with W4A16 Quantization..."
+            echo "[common_quant_param]" > quant.cfg
+            echo "quant_type=WEIGHT_QUANT" >> quant.cfg
+            echo "bit_num=4" >> quant.cfg
+            QUANT_FLAG="--configFile=quant.cfg"
+            echo "Running with W4A16 Quantization via config file..."
+            cat quant.cfg
           else
             QUANT_FLAG=""
             echo "Running with FP16 Standard Precision..."
