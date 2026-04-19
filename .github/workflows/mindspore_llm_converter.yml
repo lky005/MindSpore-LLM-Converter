@@ -40,7 +40,7 @@ jobs:
         run: |
           pip install -U "huggingface_hub[cli]"
           echo "Downloading ONNX model and tokenizer from ${{ github.event.inputs.hf_repo }}..."
-          hf download ${{ github.event.inputs.hf_repo }} --include "onnx/model_fp16.*" "tokenizer*" "*.json" --local-dir ./hf_model
+          hf download ${{ github.event.inputs.hf_repo }} --include "onnx/model_fp16.*" --include "tokenizer*" --include "*.json" --local-dir ./hf_model
           ls -lh ./hf_model/onnx
 
       - name: 4. Quantize & Compile (.ms) via converter_lite
