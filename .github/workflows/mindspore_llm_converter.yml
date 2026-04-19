@@ -1,18 +1,18 @@
-name: "Compile Qwen2.5-1.5B to MindSpore Lite (.ms)"
+name: "Compile Qwen2.5-0.5B to MindSpore Lite (.ms)"
 
 on:
   workflow_dispatch:
     inputs:
       hf_repo:
-        description: 'HuggingFace ONNX 模型仓库 (默认使用 Qwen2.5-1.5B-Instruct)'
+        description: 'HuggingFace ONNX 模型仓库 (默认使用更小的 Qwen2.5-0.5B-Instruct 进行测试)'
         required: true
-        default: 'onnx-community/Qwen2.5-1.5B-Instruct'
+        default: 'onnx-community/Qwen2.5-0.5B-Instruct'
       model_file:
         description: 'ONNX 文件路径 (相对于仓库根目录)'
         required: true
-        default: 'onnx/model_fp16.onnx'
+        default: 'onnx/model.onnx'
       quantize:
-        description: '是否开启 W4A16 4-bit 量化 (开启以大幅减少内存占用)'
+        description: '是否开启 W4A16 4-bit 量化'
         type: boolean
         default: true
 
@@ -40,7 +40,7 @@ jobs:
         run: |
           pip install -U "huggingface_hub[cli]"
           echo "Downloading ONNX model and tokenizer from ${{ github.event.inputs.hf_repo }}..."
-          hf download ${{ github.event.inputs.hf_repo }} --include "onnx/model_fp16.*" --include "tokenizer*" --include "*.json" --local-dir ./hf_model
+          hf download ${{ github.event.inputs.hf_repo }} --include "onnx/model.*" --include "tokenizer*" --include "*.json" --local-dir ./hf_model
           ls -lh ./hf_model/onnx
 
       - name: 4. Quantize & Compile (.ms) via converter_lite
@@ -59,27 +59,28 @@ jobs:
             echo "Running with FP16 Standard Precision..."
           fi
           
-          # 执行编译 (针对 OpenHarmony 端侧 NPU/GPU 优化)
+          # 执行编译 (开启大语言模型专用的 optimizeTransformer)
           $MSLITE_PATH/tools/converter/converter/converter_lite \
             --fmk=ONNX \
             --modelFile=./hf_model/${{ github.event.inputs.model_file }} \
-            --outputFile=qwen2.5_1.5b_instruct \
+            --outputFile=qwen2.5_0.5b_instruct \
             --optimize=general \
+            --optimizeTransformer=true \
             $QUANT_FLAG
           
           echo "Compilation finished. Checking size:"
-          du -sh qwen2.5_1.5b_instruct.ms
+          du -sh qwen2.5_0.5b_instruct.ms
 
       - name: 5. Prepare Artifacts
         run: |
           mkdir -p release_package
-          mv qwen2.5_1.5b_instruct.ms release_package/
+          mv qwen2.5_0.5b_instruct.ms release_package/
           cp ./hf_model/tokenizer* release_package/ || true
           cp ./hf_model/*.json release_package/ || true
           
       - name: 6. Upload Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: qwen2.5-1.5b-mslite-w4a16
+          name: qwen2.5-0.5b-mslite-w4a16
           path: release_package/
           retention-days: 7
