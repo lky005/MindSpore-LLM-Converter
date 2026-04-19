@@ -64,7 +64,7 @@ jobs:
             --fmk=ONNX \
             --modelFile=./hf_model/${{ github.event.inputs.model_file }} \
             --outputFile=qwen2.5_1.5b_instruct \
-            --optimize=ascend_oriented \
+            --optimize=general \
             $QUANT_FLAG
           
           echo "Compilation finished. Checking size:"
