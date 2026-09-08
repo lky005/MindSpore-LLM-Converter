@@ -25,7 +25,7 @@ jobs:
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "/usr/share/dotnet"
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
           df -h
 
@@ -43,10 +43,124 @@ jobs:
           hf download ${{ github.event.inputs.hf_repo }} --include "onnx/model.*" --include "tokenizer*" --include "*.json" --local-dir ./hf_model
           ls -lh ./hf_model/onnx
 
-      - name: 4. Quantize & Compile (.ms) via converter_lite
+      - name: 4. Inspect & Patch lm_head MatMul (device runtime shape check fails on it)
+        run: |
+          pip install onnx numpy
+          python - <<'PYEOF'
+          import onnx
+          import numpy as np
+          from onnx import numpy_helper
+
+          path = "./hf_model/onnx/model.onnx"
+          print("loading", path, flush=True)
+          m = onnx.load(path)
+          g = m.graph
+
+          def dims_of(vi):
+              t = vi.type.tensor_type
+              return [d.dim_param if d.dim_param else d.dim_value for d in t.shape.dim]
+
+          print("== graph inputs ==")
+          for i in g.input:
+              print(" ", i.name, "dtype=", i.type.tensor_type.elem_type, dims_of(i))
+          print("== graph outputs ==")
+          for o in g.output:
+              print(" ", o.name, "dtype=", o.type.tensor_type.elem_type, dims_of(o))
+
+          producers = {}
+          for n in g.node:
+              for o in n.output:
+                  producers[o] = n
+          initializers = {i.name: i for i in g.initializer}
+
+          logits_outs = [o.name for o in g.output if "logits" in o.name]
+          print("logits graph outputs:", logits_outs)
+          node = producers[logits_outs[0]]
+
+          # 沿着 lm_head 之前的链路打印 3 个节点，弄清数据如何流入最终矩阵乘
+          chain = [node]
+          cur = node
+          for _ in range(2):
+              srcs = [producers[i] for i in cur.input if i in producers]
+              if not srcs:
+                  break
+              cur = srcs[0]
+              chain.append(cur)
+          print("== lm_head chain (from logits backwards) ==")
+          for n in reversed(chain):
+              attrs = [(a.name, a.i if a.type == 2 else a.f if a.type == 1 else '?') for a in n.attribute]
+              print(" ", n.op_type, n.name, list(n.input), "->", list(n.output), attrs)
+
+          VOCAB = 151936
+          mm = node
+          patched = False
+          if mm.op_type == "Gemm":
+              w_name = mm.input[1]
+              w = numpy_helper.to_array(initializers[w_name])
+              print("Gemm weight:", w_name, w.shape, "attrs:", [(a.name, a.i) for a in mm.attribute])
+              trans_b = any(a.name == "transB" and a.i == 1 for a in mm.attribute)
+              if trans_b or w.shape[0] == VOCAB:
+                  wt = numpy_helper.from_array(np.ascontiguousarray(w.T), w_name + "_t")
+                  g.initializer.append(wt)
+                  mm_out = mm.output[0] + "_mm"
+                  has_bias = len(mm.input) > 2 and mm.input[2]
+                  nodes_new = [onnx.helper.make_node("MatMul", [mm.input[0], wt.name], [mm_out], name=mm.name + "_mm")]
+                  if has_bias:
+                      nodes_new.append(onnx.helper.make_node("Add", [mm_out, mm.input[2]], [mm.output[0]], name=mm.name + "_add"))
+                  else:
+                      nodes_new[0].output[0] = mm.output[0]
+                  idx = list(g.node).index(mm)
+                  del g.node[idx]
+                  for k, nn in enumerate(nodes_new):
+                      g.node.insert(idx + k, nn)
+                  patched = True
+                  print("patched: Gemm -> MatMul with transposed weight", wt.name, wt.dims)
+          elif mm.op_type == "MatMul":
+              w_name = mm.input[1]
+              src = producers.get(w_name)
+              print("MatMul weight input:", w_name, "is_initializer=", w_name in initializers, "producer=", (src.op_type, src.name) if src is not None else None)
+              if w_name in initializers:
+                  w = numpy_helper.to_array(initializers[w_name])
+                  print("MatMul weight shape:", w.shape)
+                  if w.ndim == 2 and w.shape[0] == VOCAB:
+                      wt = numpy_helper.from_array(np.ascontiguousarray(w.T), w_name + "_t")
+                      g.initializer.append(wt)
+                      mm.input[1] = wt.name
+                      patched = True
+                      print("patched: MatMul weight transposed ->", wt.name, wt.dims)
+              elif src is not None and src.op_type == "Transpose":
+                  # 权重经过 Transpose 节点：把转置烧进常量，删掉该节点
+                  src_in = src.input[0]
+                  if src_in in initializers:
+                      w = numpy_helper.to_array(initializers[src_in])
+                      perms = [list(a.ints) for a in src.attribute if a.name == "perm"]
+                      print("Transpose weight node:", src.name, "perm=", perms, "w.shape=", w.shape)
+                      wt_arr = np.transpose(w, perms[0]) if perms else w.T
+                      wt = numpy_helper.from_array(np.ascontiguousarray(wt_arr), src_in + "_fused_t")
+                      g.initializer.append(wt)
+                      mm.input[1] = wt.name
+                      idx = list(g.node).index(src)
+                      del g.node[idx]
+                      patched = True
+                      print("patched: fused Transpose into initializer", wt.name, wt.dims)
+          else:
+              print("UNEXPECTED logits producer op:", mm.op_type)
+
+          print("patched =", patched)
+          out_path = "./hf_model/onnx/model_patched.onnx" if patched else path
+          if patched:
+              onnx.save(m, out_path)
+          print("FINAL_ONNX=" + out_path)
+          with open("final_onnx_path.txt", "w") as f:
+              f.write(out_path)
+          PYEOF
+          cat final_onnx_path.txt
+          echo "FINAL_ONNX=$(cat final_onnx_path.txt)" >> $GITHUB_ENV
+
+      - name: 5. Quantize & Compile (.ms) via converter_lite
         run: |
           export LD_LIBRARY_PATH=$MSLITE_PATH/tools/converter/lib:$LD_LIBRARY_PATH
-          
+
           if [ "${{ github.event.inputs.quantize }}" == "true" ]; then
             echo "[common_quant_param]" > quant.cfg
             echo "quant_type=WEIGHT_QUANT" >> quant.cfg
@@ -58,26 +172,26 @@ jobs:
             QUANT_FLAG=""
             echo "Running with FP16 Standard Precision..."
           fi
-          
-          # 执行编译 (标准推理转换: optimize=none, 权重布局不做转置改写)
+
+          # 执行编译 (标准推理转换: optimize=none, 使用修补后的 ONNX)
           $MSLITE_PATH/tools/converter/converter/converter_lite \
             --fmk=ONNX \
-            --modelFile=./hf_model/${{ github.event.inputs.model_file }} \
+            --modelFile=${{ env.FINAL_ONNX }} \
             --outputFile=qwen2.5_0.5b_instruct \
             --optimize=none \
             $QUANT_FLAG
-          
+
           echo "Compilation finished. Checking size:"
           du -sh qwen2.5_0.5b_instruct.ms
 
-      - name: 5. Prepare Artifacts
+      - name: 6. Prepare Artifacts
         run: |
           mkdir -p release_package
           mv qwen2.5_0.5b_instruct.ms release_package/
           cp ./hf_model/tokenizer* release_package/ || true
           cp ./hf_model/*.json release_package/ || true
-          
-      - name: 6. Upload Release Artifact
+
+      - name: 7. Upload Release Artifact
         uses: actions/upload-artifact@v4
         with:
           name: qwen2.5-0.5b-mslite-w4a16
