@@ -59,13 +59,12 @@ jobs:
             echo "Running with FP16 Standard Precision..."
           fi
           
-          # 执行编译 (开启大语言模型专用的 optimizeTransformer)
+          # 执行编译 (标准推理转换: optimize=none, 权重布局不做转置改写)
           $MSLITE_PATH/tools/converter/converter/converter_lite \
             --fmk=ONNX \
             --modelFile=./hf_model/${{ github.event.inputs.model_file }} \
             --outputFile=qwen2.5_0.5b_instruct \
-            --optimize=general \
-            --optimizeTransformer=true \
+            --optimize=none \
             $QUANT_FLAG
           
           echo "Compilation finished. Checking size:"
