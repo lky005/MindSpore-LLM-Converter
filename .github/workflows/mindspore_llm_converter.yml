@@ -149,7 +149,10 @@ jobs:
           print("patched =", patched)
           out_path = "./hf_model/onnx/model_patched.onnx" if patched else path
           if patched:
-              onnx.save(m, out_path)
+              # 修补新增一份转置权重后总量超 protobuf 2GB 上限，必须外置数据保存
+              onnx.save(m, out_path, save_as_external_data=True,
+                        all_tensors_to_one_file=True, location="model_patched.onnx.data",
+                        size_threshold=1024)
           print("FINAL_ONNX=" + out_path)
           with open("final_onnx_path.txt", "w") as f:
               f.write(out_path)
