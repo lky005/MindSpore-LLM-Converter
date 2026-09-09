@@ -199,8 +199,10 @@ jobs:
           # 输出直接挂 RMSNorm 的真实输出张量（不要发明新名字，ORT 会查无此张量）
           HIDDEN_OUT = norm_node.output[0]
           log("hidden output tensor:", HIDDEN_OUT)
-          # 不猜 shape（导出里 norm 前后有 2D/3D 变换），只声明 elem_type 让运行时自行推断
-          new_outputs = [helper.make_tensor_value_info(HIDDEN_OUT, TensorProto.FLOAT16, None)]
+          # 该导出在 final norm 前把 hidden 折成 2D [batch*seq, 896]（norm 输出直连 2D MatMul lm_head），
+          # 必须按 rank-2 声明，否则 onnxsim/ORT 的 shape 校验冲突
+          new_outputs = [helper.make_tensor_value_info(HIDDEN_OUT, TensorProto.FLOAT16,
+                                                       ["bs", HIDDEN])]
           new_outputs += present_outputs
           new_graph = helper.make_graph(topo_nodes, "qwen2l", new_inputs, new_outputs, new_inits)
           m2 = helper.make_model(new_graph, opset_imports=model.opset_import)
