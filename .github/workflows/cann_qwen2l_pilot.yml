@@ -109,7 +109,8 @@ jobs:
               m = re.match(r"past_key_values\.(\d+)\.(key|value)$", past_name)
               idx, kv = m.group(1), m.group(2)
               cands = [o for o in graph.output
-                       if re.search(r"(^|\.)present.*" + idx + r"\." + kv, o.name, re.IGNORECASE)]
+                       if re.search(r"(^|\.)present\." + idx + r"\." + kv + r"$",
+                                    o.name, re.IGNORECASE)]
               assert len(cands) == 1, (past_name, [o.name for o in graph.output])
               return cands[0]
 
