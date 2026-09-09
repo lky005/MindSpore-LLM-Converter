@@ -54,6 +54,7 @@ jobs:
           import json, os, re, subprocess, sys
           import numpy as np
           import onnx
+          import onnxsim
           from onnx import TensorProto, helper, numpy_helper
 
           HF_ONNX = "hf_model/onnx/model_fp16.onnx"
@@ -93,7 +94,11 @@ jobs:
                            if any(re.match(r"model\.norm\.", x) for x in node_inits(n)))
           anchor = next(n for n in graph.node if
                         any(x.startswith("model.layers.2.input_layernorm") for x in node_inits(n)))
-          cut_tensor = anchor.input[0]
+          # 该导出图的 Mul 是 [权重, 数据] 顺序（见 norm node 日志），数据输入必须按
+          # “非初始化器”定位，盲取 input[0] 会把权重当 hidden 接走
+          anchor_data_idx = [k for k, i in enumerate(anchor.input) if i and i not in inits]
+          assert len(anchor_data_idx) == 1, ("anchor data input ambiguous", list(anchor.input))
+          cut_tensor = anchor.input[anchor_data_idx[0]]
           log("norm node:", norm_node.op_type, "inputs:", list(norm_node.input))
           log("anchor:", anchor.name, "cut_tensor:", cut_tensor)
 
