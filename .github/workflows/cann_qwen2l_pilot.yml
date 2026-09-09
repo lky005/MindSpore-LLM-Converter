@@ -94,8 +94,14 @@ jobs:
           anchor = next(n for n in graph.node if
                         any(x.startswith("model.layers.2.input_layernorm") for x in node_inits(n)))
           cut_tensor = anchor.input[0]
-          log("norm node:", norm_node.op_type, "input:", norm_node.input)
+          log("norm node:", norm_node.op_type, "inputs:", list(norm_node.input))
           log("anchor:", anchor.name, "cut_tensor:", cut_tensor)
+
+          # 数据输入位 = 非初始化器的那个输入（Mul 的操作数顺序在导出里不保证）
+          norm_data_idx = [k for k, i in enumerate(norm_node.input)
+                           if i and i not in inits]
+          assert len(norm_data_idx) == 1, ("norm data input ambiguous", list(norm_node.input))
+          norm_node.input[norm_data_idx[0]] = cut_tensor
 
           for go in graph.output:
               log("  out:", go.name)
@@ -140,6 +146,21 @@ jobs:
           topo_nodes = [n for n in graph.node if id(n) in seen]
           log("kept nodes:", len(topo_nodes), "/", len(graph.node))
 
+          # 熔断：闭包只应覆盖 layer0/1（约占 1/12），失控即带诊断退出
+          if len(topo_nodes) > len(graph.node) // 4:
+              offenders = [n.name or n.op_type for n in topo_nodes
+                           if any("layers.2." in x or "layers.23." in x for x in n.input)]
+              sys.exit(f"closure escaped: kept={len(topo_nodes)} sample_offenders={offenders[:5]}")
+
+          kept_input_names = set()
+          for n in topo_nodes:
+              for i in n.input:
+                  if i not in inits and i in graph_inputs_all:
+                      kept_input_names.add(i)
+          kept_past = [x for x in kept_input_names if x.startswith("past")]
+          assert len(kept_past) == 4, ("kept past inputs wrong", sorted(kept_past))
+          log("kept past inputs:", sorted(kept_past))
+
           ref_init_names = set()
           for n in topo_nodes:
               ref_init_names.update(i for i in n.input if i in inits)
@@ -153,11 +174,6 @@ jobs:
           HIDDEN = int(emb2.shape[1])
           del emb
 
-          kept_input_names = set()
-          for n in topo_nodes:
-              for i in n.input:
-                  if i not in inits and i in graph_inputs_all:
-                      kept_input_names.add(i)
           new_inputs = [vi for vi in graph.input if vi.name in kept_input_names]
           log("kept graph inputs:", [vi.name for vi in new_inputs])
 
