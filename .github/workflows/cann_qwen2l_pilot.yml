@@ -1,0 +1,308 @@
+name: "CANN P3 (Qwen2L 2-layer -> OM, kirinx90 tools)"
+
+on:
+  workflow_dispatch:
+
+env:
+  # 华为开发者网站 Tools 下载直链（内容中心 CDN，需带浏览器 UA/Referer 才放行）
+  DDK_URL: "https://contentcenter-vali-drcn.dbankcdn.cn/pvt_2/DeveloperAlliance_package_901_9/fa/v3/KmYm4fyVQhy8lN4CUfJAqw/DDK-tools-next-6.1.1.0.zip?HW-CC-KV=V1&HW-CC-Date=20260825T033306Z&HW-CC-Expire=315360000&HW-CC-Sign=33C3C5C5F4CFF52915D68ECB39A80BCED72327A0AAB05898C02BA1E88A957F6D"
+  DDK_SHA256: "87d7e3f186ad5c527a9385cea555559ea53c63b87dc483820523bcf7bf6f87e5"
+  PLUGIN_URL: "https://contentcenter-vali-drcn.dbankcdn.cn/pvt_2/DeveloperAlliance_package_901_9/b5/v3/NnZ7SJm2Sb6nIz2vO7EVzA/kirinx90-plugin-next-6.1.1.0.zip?HW-CC-KV=V1&HW-CC-Date=20260825T033001Z&HW-CC-Expire=315360000&HW-CC-Sign=52C3D9CE3C69DCD9051622FF7FD8080E18E63BB16CC1EF1F022410703EFBD80F"
+  PLUGIN_SHA256: "0657efdddd2267949e83af2a382603b523d30b258d72e077a6975eb87d4f10b1"
+
+jobs:
+  qwen2l:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 1. Checkout
+        uses: actions/checkout@v4
+
+      - name: 2. Free Up Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - name: 3. Download DDK + kirinx90 plugin (华为 CDN)
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+          curl -fL --retry 3 -A "$UA" -e "https://developer.huawei.com/consumer/cn/doc/" -o ddk.zip "$DDK_URL"
+          echo "$DDK_SHA256  ddk.zip" | sha256sum -c -
+          curl -fL --retry 3 -A "$UA" -e "https://developer.huawei.com/consumer/cn/doc/" -o kirinx90.zip "$PLUGIN_URL"
+          echo "$PLUGIN_SHA256  kirinx90.zip" | sha256sum -c -
+          ls -lh ddk.zip kirinx90.zip
+
+      - name: 4. Install tools (解压 + 平台插件装入 platform/)
+        run: |
+          unzip -q ddk.zip && unzip -q kirinx90.zip
+          cp -r image/ddk_platform_plugin/kirinx90 DDK-tools-next-6.1.1.0/tools/platform/
+          chmod +x DDK-tools-next-6.1.1.0/tools/tools_omg/omg DDK-tools-next-6.1.1.0/tools/tools_omg/master/omg
+
+      - name: 5. Download Qwen2.5-0.5B fp16 ONNX + deps
+        run: |
+          pip install -q -U "huggingface_hub[cli]" onnx onnxruntime numpy
+          hf download onnx-community/Qwen2.5-0.5B-Instruct --include "onnx/model_fp16.onnx*" --local-dir ./hf_model
+          ls -lh hf_model/onnx
+
+      # 图手术 + ORT 参考链路 + OMG 双桶转换（内嵌沿用本仓库 mindspore_llm_converter.yml 的
+      # heredoc 先例；路径统一 safe_path 规范化并限制在 checkout 目录内，无任何外部输入）
+      - name: 6. Surgery + reference + OMG convert
+        env:
+          OMG_PATH: DDK-tools-next-6.1.1.0/tools/tools_omg/omg
+        run: |
+          export OMG_PATH
+          python - <<'PYEOF'
+          import json, os, re, subprocess, sys
+          import numpy as np
+          import onnx
+          from onnx import TensorProto, helper, numpy_helper
+
+          HF_ONNX = "hf_model/onnx/model_fp16.onnx"
+          OUT_DIR = "cann/out"
+          VOCAB_KEEP, SEQ, PAST = 1024, 8, 1
+          REPO_ROOT = os.path.abspath(os.getcwd())
+
+          def safe_path(*parts):
+              p = os.path.abspath(os.path.join(*parts))
+              if p != REPO_ROOT and not p.startswith(REPO_ROOT + os.sep):
+                  raise ValueError("path escapes repository root: " + p)
+              return p
+
+          def log(*a):
+              print("[surgery]", *a, flush=True)
+
+          def sanitize(name):
+              return re.sub(r"[^A-Za-z0-9]", "_", name)
+
+          rng = np.random.RandomState(0)
+          os.makedirs(safe_path(OUT_DIR), exist_ok=True)
+
+          log("loading", HF_ONNX)
+          model = onnx.load(safe_path(HF_ONNX))
+          graph = model.graph
+          inits = {i.name: i for i in graph.initializer}
+          log("graph: nodes=%d inputs=%d outputs=%d inits=%d" % (
+              len(graph.node), len(graph.input), len(graph.output), len(graph.initializer)))
+          for gi in graph.input:
+              dims = [(d.dim_param or d.dim_value) for d in gi.type.tensor_type.shape.dim]
+              log("  in :", gi.name, TensorProto.DataType.Name(gi.type.tensor_type.elem_type), dims)
+
+          def node_inits(node):
+              return [i for i in node.input if i in inits]
+
+          norm_node = next(n for n in graph.node
+                           if any(re.match(r"model\.norm\.", x) for x in node_inits(n)))
+          anchor = next(n for n in graph.node if
+                        any(x.startswith("model.layers.2.input_layernorm") for x in node_inits(n)))
+          cut_tensor = anchor.input[0]
+          log("norm node:", norm_node.op_type, "input:", norm_node.input)
+          log("anchor:", anchor.name, "cut_tensor:", cut_tensor)
+
+          past_inputs = [gi.name for gi in graph.input if re.search(r"past.*(0|1)(\D|$)", gi.name)]
+          log("past inputs kept:", past_inputs)
+          present_outputs, concat_nodes = [], []
+          for pi in past_inputs:
+              consumers = [n for n in graph.node if pi in n.input]
+              assert len(consumers) == 1, f"past {pi} consumers={len(consumers)}"
+              cn = consumers[0]
+              assert cn.op_type == "Concat", f"past {pi} consumer is {cn.op_type}"
+              concat_nodes.append(cn)
+              present_outputs.append(next(o for o in graph.output if o.name == cn.output[0]))
+              log("  present:", pi, "->", cn.output[0])
+
+          norm_node.input[0] = cut_tensor
+          producer = {}
+          for n in graph.node:
+              for o in n.output:
+                  producer[o] = n
+          seen = set()
+          stack = [norm_node] + concat_nodes
+          while stack:
+              n = stack.pop()
+              if id(n) in seen:
+                  continue
+              seen.add(id(n))
+              for i in n.input:
+                  p = producer.get(i)
+                  if p is not None and id(p) not in seen:
+                      stack.append(p)
+          graph_inputs_all = {g.name for g in graph.input}
+          topo_nodes = [n for n in graph.node if id(n) in seen]
+          log("kept nodes:", len(topo_nodes), "/", len(graph.node))
+
+          ref_init_names = set()
+          for n in topo_nodes:
+              ref_init_names.update(i for i in n.input if i in inits)
+          new_inits = [inits[name] for name in ref_init_names]
+          embed_name = next(nm for nm in ref_init_names if nm.startswith("model.embed_tokens"))
+          emb = numpy_helper.to_array(inits[embed_name])
+          log("embed:", emb.shape, emb.dtype, "-> slicing to", VOCAB_KEEP)
+          emb2 = np.ascontiguousarray(emb[:VOCAB_KEEP])
+          new_inits = [numpy_helper.from_array(emb2, embed_name) if i.name == embed_name else i
+                       for i in new_inits]
+          HIDDEN = int(emb2.shape[1])
+          del emb
+
+          kept_input_names = set()
+          for n in topo_nodes:
+              for i in n.input:
+                  if i not in inits and i in graph_inputs_all:
+                      kept_input_names.add(i)
+          new_inputs = [vi for vi in graph.input if vi.name in kept_input_names]
+          log("kept graph inputs:", [vi.name for vi in new_inputs])
+
+          new_outputs = [helper.make_tensor_value_info(
+              "final_hidden", TensorProto.FLOAT16, ["batch", "seq", HIDDEN])]
+          new_outputs += present_outputs
+          new_graph = helper.make_graph(topo_nodes, "qwen2l", new_inputs, new_outputs, new_inits)
+          m2 = helper.make_model(new_graph, opset_imports=model.opset_import)
+          m2.ir_version = model.ir_version
+          onnx.save(m2, safe_path(OUT_DIR, "qwen2l.onnx"))
+          log("saved qwen2l.onnx", os.path.getsize(safe_path(OUT_DIR, "qwen2l.onnx")), "bytes")
+
+          import onnxruntime as ort
+          sess = ort.InferenceSession(safe_path(OUT_DIR, "qwen2l.onnx"),
+                                      providers=["CPUExecutionProvider"])
+          sess_inputs = sess.get_inputs()
+          out_names = [o.name for o in sess.get_outputs()]
+          for i in sess_inputs:
+              log("ORT in :", i.name, i.type, i.shape)
+          log("ORT outs:", out_names)
+
+          def resolve_dim(dim_name, bucket):
+              n = dim_name.lower()
+              if "past" in n:
+                  return bucket["past"]
+              if "total" in n:
+                  return bucket["total"]
+              if "batch" in n or "num" in n or "head" in n:
+                  return 1
+              if "cache" in n or "seq" in n or "position" in n:
+                  return bucket["seq"]
+              log("  [dim fallback->seq]", dim_name)
+              return bucket["seq"]
+
+          def present_for(past_name):
+              idx = re.search(r"(\d+)", past_name).group(1)
+              kv = "key" if "key" in past_name.lower() else (
+                  "value" if "value" in past_name.lower() else "")
+              cands = [o for o in out_names
+                       if idx in re.findall(r"\d+", o) and (kv in o.lower() if kv else True)]
+              assert len(cands) == 1, (past_name, cands)
+              return cands[0]
+
+          def build_feed(bucket, ids_value, pos_value, mask_value, past_map):
+              feeds = {}
+              for meta in sess_inputs:
+                  name, shape, dt = meta.name, meta.shape, meta.type
+                  dims = [d if isinstance(d, int) else resolve_dim(d, bucket) for d in shape]
+                  if "input_ids" in name:
+                      arr = np.asarray(ids_value, dtype=np.int64).reshape(dims)
+                  elif "position" in name:
+                      arr = np.asarray(pos_value, dtype=np.int64).reshape(dims)
+                  elif "attention_mask" in name:
+                      arr = np.asarray(mask_value, dtype=(
+                          np.int64 if "int64" in dt else np.float32)).reshape(dims)
+                  elif "past" in name:
+                      arr = past_map[name]
+                  else:
+                      arr = np.zeros(dims, dtype=np.float16 if "float16" in dt else np.float32)
+                  feeds[name] = arr
+              return feeds
+
+          def dump_feed(tag, feeds, dir_rel):
+              out_dir = safe_path(OUT_DIR, "case", dir_rel)
+              os.makedirs(out_dir, exist_ok=True)
+              lines = []
+              for name, arr in feeds.items():
+                  fname = sanitize(name) + ".bin"
+                  arr.tofile(safe_path(OUT_DIR, "case", dir_rel, fname))
+                  lines.append(f"{fname} {arr.nbytes}")
+                  log(f"  {tag} in  {name} {arr.shape} {arr.dtype} -> {fname} ({arr.nbytes}B)")
+              with open(safe_path(OUT_DIR, "case", dir_rel, "inputs.txt"), "w") as f:
+                  f.write("\n".join(lines) + "\n")
+
+          def dump_outputs(tag, named, dir_rel):
+              out_dir = safe_path(OUT_DIR, "case", dir_rel)
+              os.makedirs(out_dir, exist_ok=True)
+              lines = []
+              for name, arr in named.items():
+                  fname = sanitize(name) + ".dev.bin"
+                  arr.tofile(safe_path(OUT_DIR, "case", dir_rel, fname))
+                  ref = fname.replace(".dev.bin", ".ref32.bin")
+                  arr.astype(np.float32).tofile(safe_path(OUT_DIR, "case", dir_rel, ref))
+                  lines.append(f"{fname} {ref} {arr.nbytes}")
+                  log(f"  {tag} out {name} {arr.shape} {arr.dtype} -> {fname}")
+              with open(safe_path(OUT_DIR, "case", dir_rel, "outputs.txt"), "w") as f:
+                  f.write("\n".join(lines) + "\n")
+
+          bucket_p = {"seq": SEQ, "past": PAST, "total": SEQ + PAST}
+          past_map_p = {}
+          for meta in sess_inputs:
+              if "past" in meta.name:
+                  dims = [d if isinstance(d, int) else resolve_dim(d, bucket_p)
+                          for d in meta.shape]
+                  past_map_p[meta.name] = np.zeros(dims, dtype=np.float16)
+
+          ids0 = rng.randint(0, VOCAB_KEEP, size=SEQ).astype(np.int64)
+          feed_p = build_feed(bucket_p, ids0.reshape(1, SEQ),
+                              np.arange(SEQ, dtype=np.int64).reshape(1, SEQ),
+                              np.array([[0] + [1] * SEQ], dtype=np.int64), past_map_p)
+          named_p = dict(zip(out_names, sess.run(None, feed_p)))
+          log("prefill ok; final_hidden:", named_p["final_hidden"].shape)
+
+          past_map_d = {k: named_p[present_for(k)] for k in feed_p if "past" in k}
+          bucket_d = {"seq": 1, "past": SEQ + PAST, "total": SEQ + PAST + 1}
+          feed_d = build_feed(bucket_d,
+                              np.array([[int((ids0[-1] + 1) % VOCAB_KEEP)]]),
+                              np.array([[SEQ]], dtype=np.int64),
+                              np.array([[0] + [1] * (SEQ + PAST - 1) + [1]], dtype=np.int64),
+                              past_map_d)
+          named_d = dict(zip(out_names, sess.run(None, feed_d)))
+          log("decode ok; final_hidden:", named_d["final_hidden"].shape)
+
+          dump_feed("prefill", feed_p, "prefill")
+          dump_outputs("prefill", named_p, "prefill")
+          dump_feed("decode", feed_d, "decode")
+          dump_outputs("decode", named_d, "decode")
+
+          omg = safe_path(os.environ["OMG_PATH"])
+          omg_cwd = os.path.dirname(omg)
+          BUCKETS = {"prefill": bucket_p, "decode": bucket_d}
+          meta = {"inputs": {vi.name: [(d.dim_param or d.dim_value)
+                                       for d in vi.type.tensor_type.shape.dim]
+                             for vi in new_inputs}, "omg": {}}
+          for tag, bucket in BUCKETS.items():
+              parts = []
+              for vi in new_inputs:
+                  dims = []
+                  for d in vi.type.tensor_type.shape.dim:
+                      dims.append(str(d.dim_value if d.dim_value
+                                      else resolve_dim(d.dim_param, bucket)))
+                  parts.append(vi.name + ":" + ",".join(dims))
+              cmd = [omg, "--model", safe_path(OUT_DIR, "qwen2l.onnx"), "--framework", "5",
+                     "--output", safe_path(OUT_DIR, "qwen2l_" + tag),
+                     "--input_shape", ";".join(parts)]
+              meta["omg"][tag] = " ".join(cmd)
+              log("RUN:", " ".join(cmd))
+              r = subprocess.run(cmd, cwd=omg_cwd, capture_output=True, text=True)
+              tail = (r.stdout + r.stderr).splitlines()[-25:]
+              log(f"omg {tag} rc={r.returncode}\n" + "\n".join(tail))
+              if r.returncode != 0:
+                  sys.exit("omg " + tag + " failed")
+
+          with open(safe_path(OUT_DIR, "meta.json"), "w") as f:
+              json.dump(meta, f, indent=1)
+          log("DONE: case dirs + 2 OM ready")
+          PYEOF
+          find cann/out -type f | head -40
+          ls -la cann/out/
+
+      - name: 7. Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen2l-om
+          path: |
+            cann/out/
+            DDK-tools-next-6.1.1.0/tools/tools_omg/check_result.json
+          if-no-files-found: warn
