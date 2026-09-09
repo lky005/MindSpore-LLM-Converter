@@ -1,0 +1,64 @@
+name: "CANN OM Pilot (tiny CNN -> OM, kirinx90 tools)"
+
+on:
+  workflow_dispatch:
+
+env:
+  # 华为开发者网站 Tools 下载直链（内容中心 CDN，需带浏览器 UA/Referer 才放行）
+  DDK_URL: "https://contentcenter-vali-drcn.dbankcdn.cn/pvt_2/DeveloperAlliance_package_901_9/fa/v3/KmYm4fyVQhy8lN4CUfJAqw/DDK-tools-next-6.1.1.0.zip?HW-CC-KV=V1&HW-CC-Date=20260825T033306Z&HW-CC-Expire=315360000&HW-CC-Sign=33C3C5C5F4CFF52915D68ECB39A80BCED72327A0AAB05898C02BA1E88A957F6D"
+  DDK_SHA256: "87d7e3f186ad5c527a9385cea555559ea53c63b87dc483820523bcf7bf6f87e5"
+  PLUGIN_URL: "https://contentcenter-vali-drcn.dbankcdn.cn/pvt_2/DeveloperAlliance_package_901_9/b5/v3/NnZ7SJm2Sb6nIz2vO7EVzA/kirinx90-plugin-next-6.1.1.0.zip?HW-CC-KV=V1&HW-CC-Date=20260825T033001Z&HW-CC-Expire=315360000&HW-CC-Sign=52C3D9CE3C69DCD9051622FF7FD8080E18E63BB16CC1EF1F022410703EFBD80F"
+  PLUGIN_SHA256: "0657efdddd2267949e83af2a382603b523d30b258d72e077a6975eb87d4f10b1"
+
+jobs:
+  pilot:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 1. Checkout
+        uses: actions/checkout@v4
+
+      - name: 2. Download DDK + kirinx90 plugin (华为 CDN)
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+          curl -fL --retry 3 -A "$UA" -e "https://developer.huawei.com/consumer/cn/doc/" -o ddk.zip "$DDK_URL"
+          echo "$DDK_SHA256  ddk.zip" | sha256sum -c -
+          curl -fL --retry 3 -A "$UA" -e "https://developer.huawei.com/consumer/cn/doc/" -o kirinx90.zip "$PLUGIN_URL"
+          echo "$PLUGIN_SHA256  kirinx90.zip" | sha256sum -c -
+          ls -lh ddk.zip kirinx90.zip
+
+      - name: 3. Install tools (解压 + 平台插件装入 platform/)
+        run: |
+          unzip -q ddk.zip && unzip -q kirinx90.zip
+          cp -r image/ddk_platform_plugin/kirinx90 DDK-tools-next-6.1.1.0/tools/platform/
+          ls DDK-tools-next-6.1.1.0/tools/platform/kirinx90
+          chmod +x DDK-tools-next-6.1.1.0/tools/tools_omg/omg DDK-tools-next-6.1.1.0/tools/tools_omg/master/omg
+
+      - name: 4. Generate tiny CNN ONNX + 参考输入输出
+        run: |
+          pip install "onnx>=1.14" numpy
+          python cann/tiny_cnn.py
+          ls -lh cann/
+
+      - name: 5. OMG convert (ONNX -> OM)
+        run: |
+          cd DDK-tools-next-6.1.1.0/tools/tools_omg
+          ./omg --help 2>&1 | head -60 || true
+          ./omg --model "$GITHUB_WORKSPACE/cann/tiny_cnn.onnx" \
+                --framework 5 \
+                --output "$GITHUB_WORKSPACE/build/tiny_cnn" \
+                --input_shape "input:1,3,32,32" 2>&1 | tee omg_run.log
+          echo "---- check_result.json ----"
+          cat check_result.json 2>/dev/null || echo "(no check_result.json)"
+          ls -la "$GITHUB_WORKSPACE/build/" || true
+
+      - name: 6. Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: om-pilot
+          path: |
+            build/
+            DDK-tools-next-6.1.1.0/tools/tools_omg/omg_run.log
+            DDK-tools-next-6.1.1.0/tools/tools_omg/check_result.json
+            cann/
+          if-no-files-found: warn
