@@ -39,7 +39,7 @@ jobs:
 
       - name: 5. Download Qwen2.5-0.5B fp16 ONNX + deps
         run: |
-          pip install -q -U "huggingface_hub[cli]" onnx onnxruntime numpy
+          pip install -q -U "huggingface_hub[cli]" onnx onnxruntime onnxsim numpy
           hf download onnx-community/Qwen2.5-0.5B-Instruct --include "onnx/model_fp16.onnx*" --local-dir ./hf_model
           ls -lh hf_model/onnx
 
@@ -297,43 +297,49 @@ jobs:
                   f.write("\n".join(lines) + "\n")
 
           bucket_p = {"seq": SEQ, "past": PAST, "total": SEQ + PAST}
+          bucket_d = {"seq": 1, "past": SEQ + PAST, "total": SEQ + PAST + 1}
+
+          def static_shapes(bucket):
+              return {m.name: [d if isinstance(d, int) else resolve_dim(d, bucket)
+                               for d in m.shape] for m in sess_inputs}
+
           past_map_p = {}
           for meta in sess_inputs:
               if "past" in meta.name:
-                  dims = [d if isinstance(d, int) else resolve_dim(d, bucket_p)
-                          for d in meta.shape]
                   past_map_p[meta.name] = np.zeros(
-                      dims, dtype=np.float16 if "float16" in meta.type else np.float32)
+                      static_shapes(bucket_p)[meta.name],
+                      dtype=np.float16 if "float16" in meta.type else np.float32)
 
           ids0 = rng.randint(0, VOCAB_KEEP, size=SEQ).astype(np.int64)
-          feed_p = build_feed(bucket_p, ids0.reshape(1, SEQ),
-                              np.arange(SEQ, dtype=np.int64).reshape(1, SEQ),
-                              np.array([[0] + [1] * SEQ], dtype=np.int64), past_map_p)
-          named_p = dict(zip(out_names, sess.run(None, feed_p)))
-          log("prefill ok; hidden:", named_p[HIDDEN_OUT].shape)
-
-          past_map_d = {k: named_p[present_for(k)] for k in feed_p if "past" in k}
-          bucket_d = {"seq": 1, "past": SEQ + PAST, "total": SEQ + PAST + 1}
-          feed_d = build_feed(bucket_d,
-                              np.array([[int((ids0[-1] + 1) % VOCAB_KEEP)]]),
-                              np.array([[SEQ]], dtype=np.int64),
-                              np.array([[0] + [1] * (SEQ + PAST - 1) + [1]], dtype=np.int64),
-                              past_map_d)
-          named_d = dict(zip(out_names, sess.run(None, feed_d)))
-          log("decode ok; hidden:", named_d[HIDDEN_OUT].shape)
-
-          dump_feed("prefill", feed_p, "prefill")
-          dump_outputs("prefill", named_p, "prefill")
-          dump_feed("decode", feed_d, "decode")
-          dump_outputs("decode", named_d, "decode")
-
           omg = safe_path(os.environ["OMG_PATH"])
           omg_cwd = os.path.dirname(omg)
-          BUCKETS = {"prefill": bucket_p, "decode": bucket_d}
           meta = {"inputs": {vi.name: [(d.dim_param or d.dim_value)
                                        for d in vi.type.tensor_type.shape.dim]
                              for vi in new_inputs}, "omg": {}}
-          for tag, bucket in BUCKETS.items():
+
+          # 每桶：onnxsim 静态特化（把 Shape/ConstantOfShape/Trilu 掩码链折叠成常量，
+          # kirinx90 不支持 Trilu——预检唯一失败算子）→ ORT 参考运行 → OMG 转换
+          so = ort.SessionOptions()
+          so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+          so.log_severity_level = 3
+
+          def run_bucket(tag, bucket, ids_value, pos_value, mask_value, past_map):
+              sim, ok = onnxsim.simplify(
+                  onnx.load(safe_path(OUT_DIR, "qwen2l.onnx")),
+                  overwrite_input_shapes=static_shapes(bucket))
+              assert ok, "onnxsim failed: " + tag
+              p_onnx = safe_path(OUT_DIR, "qwen2l_" + tag + ".onnx")
+              onnx.save(sim, p_onnx)
+              log("simplified", tag, os.path.getsize(p_onnx), "bytes")
+
+              s = ort.InferenceSession(p_onnx, sess_options=so,
+                                       providers=["CPUExecutionProvider"])
+              feeds = build_feed(bucket, ids_value, pos_value, mask_value, past_map)
+              named = dict(zip([o.name for o in s.get_outputs()], s.run(None, feeds)))
+              log(tag, "ok; hidden:", named[HIDDEN_OUT].shape)
+              dump_feed(tag, feeds, tag)
+              dump_outputs(tag, named, tag)
+
               parts = []
               for vi in new_inputs:
                   dims = []
@@ -342,7 +348,7 @@ jobs:
                                       else resolve_dim(d.dim_param, bucket)))
                   parts.append(vi.name + ":" + ",".join(dims))
               otypes = ";".join(o.name + ":FP32" for o in new_outputs)
-              cmd = [omg, "--model", safe_path(OUT_DIR, "qwen2l.onnx"), "--framework", "5",
+              cmd = [omg, "--model", p_onnx, "--framework", "5",
                      "--output", safe_path(OUT_DIR, "qwen2l_" + tag),
                      "--output_type", otypes,
                      "--input_shape", ";".join(parts)]
@@ -358,10 +364,25 @@ jobs:
                       with open(crj, "r", encoding="utf-8", errors="replace") as f:
                           print(f.read()[:8000], flush=True)
                   sys.exit("omg " + tag + " failed")
+              return named
+
+          named_p = run_bucket("prefill", bucket_p,
+                               ids0.reshape(1, SEQ),
+                               np.arange(SEQ, dtype=np.int64).reshape(1, SEQ),
+                               np.array([[0] + [1] * SEQ], dtype=np.int64),
+                               past_map_p)
+          past_map_d = {m.name: named_p[present_for(m.name)]
+                        for m in sess_inputs if "past" in m.name}
+          named_d = run_bucket("decode", bucket_d,
+                               np.array([[int((ids0[-1] + 1) % VOCAB_KEEP)]]),
+                               np.array([[SEQ]], dtype=np.int64),
+                               np.array([[0] + [1] * (SEQ + PAST - 1) + [1]], dtype=np.int64),
+                               past_map_d)
 
           with open(safe_path(OUT_DIR, "meta.json"), "w") as f:
               json.dump(meta, f, indent=1)
           log("DONE: case dirs + 2 OM ready")
+          PYEOF
           PYEOF
           find cann/out -type f | head -40
           ls -la cann/out/
