@@ -330,11 +330,47 @@ jobs:
           so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
           so.log_severity_level = 3
 
+          def fix_gather_indices(mp):
+              """kirinx90 的 GatherV2D 拒收 int64 indices（onnxsim 折叠出的常量多为 int64）。
+              ONNX 规范允许 indices 用 int32：常量直接重写，非常量插 Cast。"""
+              g = mp.graph
+              inferred = onnx.shape_inference.infer_shapes(mp)
+              dtmap = {}
+              for vi in list(inferred.graph.value_info) + list(inferred.graph.input):
+                  dtmap[vi.name] = vi.type.tensor_type.elem_type
+              init_map = {i.name: i for i in g.initializer}
+              fixes = []
+              for n in g.node:
+                  if n.op_type != "Gather" or len(n.input) < 2:
+                      continue
+                  idx_t = n.input[1]
+                  dt = dtmap.get(idx_t)
+                  if dt is None and idx_t in init_map:
+                      dt = init_map[idx_t].data_type
+                  if dt == TensorProto.INT64:
+                      fixes.append((n, idx_t))
+              for n, idx_t in fixes:
+                  if idx_t in init_map:
+                      arr = numpy_helper.to_array(init_map[idx_t])
+                      g.initializer.remove(init_map[idx_t])
+                      new_t = numpy_helper.from_array(arr.astype(np.int32), idx_t + "_i32")
+                      g.initializer.append(new_t)
+                      init_map[new_t.name] = new_t
+                  else:
+                      cast = helper.make_node("Cast", [idx_t], [idx_t + "_i32"],
+                                              to=TensorProto.INT32,
+                                              name=idx_t.strip("/") + "_to_i32")
+                      g.node.insert(list(g.node).index(n), cast)
+                  n.input[1] = idx_t + "_i32"
+              log("gather int64->int32 fixes:", len(fixes))
+              return mp
+
           def run_bucket(tag, bucket, ids_value, pos_value, mask_value, past_map):
               sim, ok = onnxsim.simplify(
                   onnx.load(safe_path(OUT_DIR, "qwen2l.onnx")),
                   overwrite_input_shapes=static_shapes(bucket))
               assert ok, "onnxsim failed: " + tag
+              fix_gather_indices(sim)
               p_onnx = safe_path(OUT_DIR, "qwen2l_" + tag + ".onnx")
               onnx.save(sim, p_onnx)
               log("simplified", tag, os.path.getsize(p_onnx), "bytes")
