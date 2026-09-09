@@ -243,18 +243,21 @@ jobs:
               assert len(cands) == 1, (past_name, cands)
               return cands[0]
 
+          def _idtype(dt):
+              # 图入口已改为 int32（NPU 友好），喂什么 dtype 以会话元数据为准
+              return np.int64 if "int64" in dt else (np.int32 if "int32" in dt else np.float32)
+
           def build_feed(bucket, ids_value, pos_value, mask_value, past_map):
               feeds = {}
               for meta in sess_inputs:
                   name, shape, dt = meta.name, meta.shape, meta.type
                   dims = [d if isinstance(d, int) else resolve_dim(d, bucket) for d in shape]
                   if "input_ids" in name:
-                      arr = np.asarray(ids_value, dtype=np.int64).reshape(dims)
+                      arr = np.asarray(ids_value, dtype=_idtype(dt)).reshape(dims)
                   elif "position" in name:
-                      arr = np.asarray(pos_value, dtype=np.int64).reshape(dims)
+                      arr = np.asarray(pos_value, dtype=_idtype(dt)).reshape(dims)
                   elif "attention_mask" in name:
-                      arr = np.asarray(mask_value, dtype=(
-                          np.int64 if "int64" in dt else np.float32)).reshape(dims)
+                      arr = np.asarray(mask_value, dtype=_idtype(dt)).reshape(dims)
                   elif "past" in name:
                       arr = past_map[name]
                   else:
