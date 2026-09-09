@@ -97,25 +97,35 @@ jobs:
           log("norm node:", norm_node.op_type, "input:", norm_node.input)
           log("anchor:", anchor.name, "cut_tensor:", cut_tensor)
 
-          past_inputs = [gi.name for gi in graph.input if re.search(r"past.*(0|1)(\D|$)", gi.name)]
+          for go in graph.output:
+              log("  out:", go.name)
+
+          past_inputs = [gi.name for gi in graph.input
+                         if re.match(r"past_key_values\.(0|1)\.(key|value)$", gi.name)]
+          assert len(past_inputs) == 4, past_inputs
           log("past inputs kept:", past_inputs)
-          present_outputs, concat_nodes = [], []
-          for pi in past_inputs:
-              consumers = [n for n in graph.node if pi in n.input]
-              assert len(consumers) == 1, f"past {pi} consumers={len(consumers)}"
-              cn = consumers[0]
-              assert cn.op_type == "Concat", f"past {pi} consumer is {cn.op_type}"
-              concat_nodes.append(cn)
-              present_outputs.append(next(o for o in graph.output if o.name == cn.output[0]))
-              log("  present:", pi, "->", cn.output[0])
+
+          def present_vi_for(past_name):
+              m = re.match(r"past_key_values\.(\d+)\.(key|value)$", past_name)
+              idx, kv = m.group(1), m.group(2)
+              cands = [o for o in graph.output
+                       if re.search(r"(^|\.)present.*" + idx + r"\." + kv, o.name, re.IGNORECASE)]
+              assert len(cands) == 1, (past_name, [o.name for o in graph.output])
+              return cands[0]
 
           norm_node.input[0] = cut_tensor
           producer = {}
           for n in graph.node:
               for o in n.output:
                   producer[o] = n
+          present_outputs = []
+          stack = [norm_node]
+          for pi in past_inputs:
+              vi = present_vi_for(pi)
+              present_outputs.append(vi)
+              log("  present:", pi, "->", vi.name)
+              stack.append(producer[vi.name])
           seen = set()
-          stack = [norm_node] + concat_nodes
           while stack:
               n = stack.pop()
               if id(n) in seen:
@@ -164,12 +174,15 @@ jobs:
                                       providers=["CPUExecutionProvider"])
           sess_inputs = sess.get_inputs()
           out_names = [o.name for o in sess.get_outputs()]
+          out_dtype = {o.name: o.type for o in sess.get_outputs()}
           for i in sess_inputs:
               log("ORT in :", i.name, i.type, i.shape)
           log("ORT outs:", out_names)
 
           def resolve_dim(dim_name, bucket):
               n = dim_name.lower()
+              if "past" in n and ("+" in n or "plus" in n):
+                  return bucket["past"] + bucket["seq"]
               if "past" in n:
                   return bucket["past"]
               if "total" in n:
@@ -228,10 +241,15 @@ jobs:
               for name, arr in named.items():
                   fname = sanitize(name) + ".dev.bin"
                   arr.tofile(safe_path(OUT_DIR, "case", dir_rel, fname))
-                  ref = fname.replace(".dev.bin", ".ref32.bin")
-                  arr.astype(np.float32).tofile(safe_path(OUT_DIR, "case", dir_rel, ref))
-                  lines.append(f"{fname} {ref} {arr.nbytes}")
-                  log(f"  {tag} out {name} {arr.shape} {arr.dtype} -> {fname}")
+                  dt = out_dtype[name]
+                  if "float" in dt:
+                      ref = fname.replace(".dev.bin", ".ref32.bin")
+                      arr.astype(np.float32).tofile(safe_path(OUT_DIR, "case", dir_rel, ref))
+                      tag2 = "F16" if "float16" in dt else "F32"
+                  else:
+                      ref, tag2 = fname, "NA"
+                  lines.append(f"{fname} {ref} {arr.nbytes} {tag2}")
+                  log(f"  {tag} out {name} {arr.shape} {arr.dtype} -> {fname} [{tag2}]")
               with open(safe_path(OUT_DIR, "case", dir_rel, "outputs.txt"), "w") as f:
                   f.write("\n".join(lines) + "\n")
 
@@ -241,7 +259,8 @@ jobs:
               if "past" in meta.name:
                   dims = [d if isinstance(d, int) else resolve_dim(d, bucket_p)
                           for d in meta.shape]
-                  past_map_p[meta.name] = np.zeros(dims, dtype=np.float16)
+                  past_map_p[meta.name] = np.zeros(
+                      dims, dtype=np.float16 if "float16" in meta.type else np.float32)
 
           ids0 = rng.randint(0, VOCAB_KEEP, size=SEQ).astype(np.int64)
           feed_p = build_feed(bucket_p, ids0.reshape(1, SEQ),
