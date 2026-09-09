@@ -349,19 +349,25 @@ jobs:
                       dt = init_map[idx_t].data_type
                   if dt == TensorProto.INT64:
                       fixes.append((n, idx_t))
+              cast_done = {}
               for n, idx_t in fixes:
+                  if idx_t in cast_done:
+                      n.input[1] = cast_done[idx_t]
+                      continue
                   if idx_t in init_map:
                       arr = numpy_helper.to_array(init_map[idx_t])
                       g.initializer.remove(init_map[idx_t])
                       new_t = numpy_helper.from_array(arr.astype(np.int32), idx_t + "_i32")
                       g.initializer.append(new_t)
                       init_map[new_t.name] = new_t
+                      cast_done[idx_t] = new_t.name
                   else:
                       cast = helper.make_node("Cast", [idx_t], [idx_t + "_i32"],
                                               to=TensorProto.INT32,
                                               name=idx_t.strip("/") + "_to_i32")
                       g.node.insert(list(g.node).index(n), cast)
-                  n.input[1] = idx_t + "_i32"
+                      cast_done[idx_t] = idx_t + "_i32"
+                  n.input[1] = cast_done[idx_t]
               log("gather int64->int32 fixes:", len(fixes))
               return mp
 
