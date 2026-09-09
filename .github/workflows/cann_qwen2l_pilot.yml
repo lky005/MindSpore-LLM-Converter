@@ -352,6 +352,11 @@ jobs:
               tail = (r.stdout + r.stderr).splitlines()[-25:]
               log(f"omg {tag} rc={r.returncode}\n" + "\n".join(tail))
               if r.returncode != 0:
+                  crj = os.path.join(omg_cwd, "check_result.json")
+                  if os.path.exists(crj):
+                      log("check_result.json:")
+                      with open(crj, "r", encoding="utf-8", errors="replace") as f:
+                          print(f.read()[:8000], flush=True)
                   sys.exit("omg " + tag + " failed")
 
           with open(safe_path(OUT_DIR, "meta.json"), "w") as f:
@@ -367,6 +372,8 @@ jobs:
         with:
           name: qwen2l-om
           path: |
-            cann/out/
+            cann/out/case/
+            cann/out/*.om
+            cann/out/meta.json
             DDK-tools-next-6.1.1.0/tools/tools_omg/check_result.json
           if-no-files-found: warn
