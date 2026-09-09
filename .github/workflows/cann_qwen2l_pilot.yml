@@ -177,8 +177,25 @@ jobs:
           new_inputs = [vi for vi in graph.input if vi.name in kept_input_names]
           log("kept graph inputs:", [vi.name for vi in new_inputs])
 
+          # NPU 侧对 int64 输入支持存疑（MindSpore NPU 先例是 int32 主输入）：
+          # 三个 int64 输入改为 int32 入口，图内首个节点 Cast 回 int64 保持原语义
+          cast_nodes = []
+          for k, vi in enumerate(new_inputs):
+              if vi.type.tensor_type.elem_type != TensorProto.INT64:
+                  continue
+              dims = [d.dim_param or d.dim_value for d in vi.type.tensor_type.shape.dim]
+              cast_nodes.append(helper.make_node(
+                  "Cast", [vi.name + "_i32in"], [vi.name],
+                  to=TensorProto.INT64, name="cast_in_" + vi.name))
+              new_inputs[k] = helper.make_tensor_value_info(
+                  vi.name + "_i32in", TensorProto.INT32, dims)
+          topo_nodes = cast_nodes + topo_nodes
+
+          # 输出直接挂 RMSNorm 的真实输出张量（不要发明新名字，ORT 会查无此张量）
+          HIDDEN_OUT = norm_node.output[0]
+          log("hidden output tensor:", HIDDEN_OUT)
           new_outputs = [helper.make_tensor_value_info(
-              "final_hidden", TensorProto.FLOAT16, ["batch", "seq", HIDDEN])]
+              HIDDEN_OUT, TensorProto.FLOAT16, ["batch", "seq", HIDDEN])]
           new_outputs += present_outputs
           new_graph = helper.make_graph(topo_nodes, "qwen2l", new_inputs, new_outputs, new_inits)
           m2 = helper.make_model(new_graph, opset_imports=model.opset_import)
@@ -262,7 +279,7 @@ jobs:
                   if "float" in dt:
                       ref = fname.replace(".dev.bin", ".ref32.bin")
                       arr.astype(np.float32).tofile(safe_path(OUT_DIR, "case", dir_rel, ref))
-                      tag2 = "F16" if "float16" in dt else "F32"
+                      tag2 = "F32"  # 设备侧已强制 --output_type FP32，按 F32 对拍
                   else:
                       ref, tag2 = fname, "NA"
                   lines.append(f"{fname} {ref} {arr.nbytes} {tag2}")
@@ -284,7 +301,7 @@ jobs:
                               np.arange(SEQ, dtype=np.int64).reshape(1, SEQ),
                               np.array([[0] + [1] * SEQ], dtype=np.int64), past_map_p)
           named_p = dict(zip(out_names, sess.run(None, feed_p)))
-          log("prefill ok; final_hidden:", named_p["final_hidden"].shape)
+          log("prefill ok; hidden:", named_p[HIDDEN_OUT].shape)
 
           past_map_d = {k: named_p[present_for(k)] for k in feed_p if "past" in k}
           bucket_d = {"seq": 1, "past": SEQ + PAST, "total": SEQ + PAST + 1}
@@ -294,7 +311,7 @@ jobs:
                               np.array([[0] + [1] * (SEQ + PAST - 1) + [1]], dtype=np.int64),
                               past_map_d)
           named_d = dict(zip(out_names, sess.run(None, feed_d)))
-          log("decode ok; final_hidden:", named_d["final_hidden"].shape)
+          log("decode ok; hidden:", named_d[HIDDEN_OUT].shape)
 
           dump_feed("prefill", feed_p, "prefill")
           dump_outputs("prefill", named_p, "prefill")
@@ -315,8 +332,10 @@ jobs:
                       dims.append(str(d.dim_value if d.dim_value
                                       else resolve_dim(d.dim_param, bucket)))
                   parts.append(vi.name + ":" + ",".join(dims))
+              otypes = ";".join(o.name + ":FP32" for o in new_outputs)
               cmd = [omg, "--model", safe_path(OUT_DIR, "qwen2l.onnx"), "--framework", "5",
                      "--output", safe_path(OUT_DIR, "qwen2l_" + tag),
+                     "--output_type", otypes,
                      "--input_shape", ";".join(parts)]
               meta["omg"][tag] = " ".join(cmd)
               log("RUN:", " ".join(cmd))
