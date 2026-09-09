@@ -432,7 +432,6 @@ jobs:
               json.dump(meta, f, indent=1)
           log("DONE: case dirs + 2 OM ready")
           PYEOF
-          PYEOF
           find cann/out -type f | head -40
           ls -la cann/out/
 
