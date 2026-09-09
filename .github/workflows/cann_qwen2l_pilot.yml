@@ -194,8 +194,8 @@ jobs:
           # 输出直接挂 RMSNorm 的真实输出张量（不要发明新名字，ORT 会查无此张量）
           HIDDEN_OUT = norm_node.output[0]
           log("hidden output tensor:", HIDDEN_OUT)
-          new_outputs = [helper.make_tensor_value_info(
-              HIDDEN_OUT, TensorProto.FLOAT16, ["batch", "seq", HIDDEN])]
+          # 不猜 shape（导出里 norm 前后有 2D/3D 变换），只声明 elem_type 让运行时自行推断
+          new_outputs = [helper.make_tensor_value_info(HIDDEN_OUT, TensorProto.FLOAT16, None)]
           new_outputs += present_outputs
           new_graph = helper.make_graph(topo_nodes, "qwen2l", new_inputs, new_outputs, new_inits)
           m2 = helper.make_model(new_graph, opset_imports=model.opset_import)
@@ -204,8 +204,14 @@ jobs:
           log("saved qwen2l.onnx", os.path.getsize(safe_path(OUT_DIR, "qwen2l.onnx")), "bytes")
 
           import onnxruntime as ort
+
+          # 剪枝后的 fp16 图会触发 ORT SimplifiedLayerNormFusion 的精度 cast 插入 bug，
+          # 参考推理关闭图优化，按原始 ONNX 语义跑
+          so = ort.SessionOptions()
+          so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+          so.log_severity_level = 3
           sess = ort.InferenceSession(safe_path(OUT_DIR, "qwen2l.onnx"),
-                                      providers=["CPUExecutionProvider"])
+                                      sess_options=so, providers=["CPUExecutionProvider"])
           sess_inputs = sess.get_inputs()
           out_names = [o.name for o in sess.get_outputs()]
           out_dtype = {o.name: o.type for o in sess.get_outputs()}
